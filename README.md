@@ -1,4 +1,4 @@
-# esphome_mspacontroller
+# ESPHome M-Spa Controller
 
 ESPHome controller for M-Spa spabaths.
 

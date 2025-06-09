@@ -117,9 +117,13 @@ written as 0xXX here. Check the module logic to see how to calculate it from the
 
 #### Unknown commands sent by the remote, further investigation needed
 0xA5 0x09 
+
 0xA5 0x10 
+
 0xA5 0x11 
+
 0xA5 0x0A 
+
 One of these could be related to the timer function
 
 #### Unknown commands sent by the bath, further investigation needed

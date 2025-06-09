@@ -2,7 +2,7 @@
 
 ESPHome controller for M-Spa spabaths.
 
-__USE AT YOUR OWN RISK, I TAKE NO RESPONSIBILITY FOR BRICKED SPABATHS THROUGH USING THIS MODULE!__
+__USE AT YOUR OWN RISK, I TAKE NO RESPONSIBILITY FOR BRICKED SPABATHS AFTER USING THIS MODULE!__
 
 This controller will replace the wire connected controller for M-Spa spabaths.
 

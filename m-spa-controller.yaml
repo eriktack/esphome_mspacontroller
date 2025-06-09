@@ -1,0 +1,511 @@
+# ESPHome controller for M-Spa spabaths.
+#
+# USE AT YOUR OWN RISK, I TAKE NO RESPONSIBILITY FOR BRICKED SPABATHS THROUGH USING THIS MODULE!
+#
+# This controller will replace the wire connected controller for M-Spa spabaths.
+#
+# This is heavily based on the work done by Marc Horst, all credit for the decoding of the M-Spa UART logic goes to him.
+# I used this article as base for this module, please read it for a more thorough introduction: 
+# https://www.worldhack.de/your-mspa-goes-smart-step-by-step-to-a-diy-smart-home-hot-tub-wi-fi-upgrade/
+# 
+# The ESP32 will replace the wired controllers as connecting both of them would send conflicting signals to the bath.
+# But for debugging purposes you could connect the ESP32 RX pin to either direction with the controlelr still attached
+# to read the communication and further improve this module.
+#
+# Note: Different baths use different UART logic levels. Some baths uses 5V and could damage an ESP32 if connected directly.
+# I strongly recommend using a logic level shifter to 3V3 to avoid damaging your ESP32 if your bath uses 5V logic levels.
+# To check the logic level, simply measure DC voltage between any of the center pins of the connector and ground.
+# 
+# Here is an article on a DIY level shifter I first used to read UART signals (though I never tried to control the bath).
+# I recommend just getting a real one though, theyre quite cheap:
+# https://hackaday.com/2016/12/05/taking-it-to-another-level-making-3-3v-and-5v-logic-communicate-with-level-shifters/
+#
+# Hardware used:
+# M-Spa Super Camaro P-CA069 (5V logic levels)
+# AZDelivery ESP32 Dev Kit C V4 NodeMCU WLAN WiFi Development Board (Amazon)
+# Gebildet 3.3V-5V 4 Channel Logic Level Converter Bi-Directional Shifter Module CYT1076 (Amazon)
+# Male JST XH 2.54mm 4 Pin connector (the one with the housing)
+#
+# I tried to mimic the remote as much as I could, but some functionality might not work exactly as the original remote. 
+# I did not bother to figure out the timer for example as that can be handled from Home Assistant instead.
+# 
+# Wiring:
+# The connector from the bath should have +5V and GND as the outer two pins, and the middle two for logic. If you inspect
+# the wired remote, you should see GND directly connected to the big copper areas on the circuit board, and the +5V pin to
+# the plus side of a large capacitor next to the JST connector. Different baths may have different pinout, you need to find
+# out that yourself. The 5V pin should have a fairly stable 5V level, and the logic pins should fluctuate a little below 5V. 
+#
+# Connect 5V and GND from the bath to 5V and GND respectively on the ESP32, use a multimeter to be certain. 
+# Connect The middle pins to pin 16 and 17 of the ESP32. You need to figure out which one is which, you should get a 
+# temperature reading from the bath (check logs or the current_temperature entity) when you connected them correctly.
+# If your bath uses 5V logic and you use a level shifter, you also need to connect 3V3 from the ESP32 to the low side of 
+# the level shifter.
+#
+# If all is working correctly, when you power the bath, you should get a temperature reading in a second or two. If you check
+# the logs of the module, you should aso see the commands it sends.
+# 
+# I added a selector for type of bath as some baths expect [target temperature] * 2 when setting it. Mine did not.
+# If your bath expects double value and is not listed, use the type 'Other (double temp)'. 
+# I am also not entirely sure what the target temp setting does, because the bath itself will keep heating even if you reach 
+# that value - more research needed.
+#
+# The module is rigged to turn on the filter as well if the heater is turned on, and also stop heating if the target temp is 
+# met. It should stop heating once it reaches [taget].5°C. After it reaches the target, the temp needs to dip below the
+# target before it starts again. This is done to avoid the heater continuously going on/off.
+# Example: If the target is 35°C, the module will heat until 35.5°C, then wait until the temp is 34.5°C before starting again.
+#
+# As only some baths have some functions you should disable the switches for the ones you dont have. I disabled Jet and UV 
+# by default as I dont have those in my bath.
+#
+# There is also an external energy meter configured (but disabled) named "sensor.energimatare_spabad_power", change this
+# to your own if you have a sensor in Home Assistant that measures its power. Otherwise just remove it entirely.
+#
+# If the controller is restarted, the bath stops, so be sure to start it again should that happen.
+# 
+# Also, configure the default ESPHome settings like encryption, ota, wifi and backup ap.
+# If you want to debug something, enable more logging the INFO in the logger section.
+# 
+# Logic codes:
+# All commands are in 4 byte sequences, starting with 0xA5, both from and to the bath. The checksum is always
+# written as 0xXX here. Check the module logic to see how to calculate it from the values.
+# 0xA5 [command] [value] [checksum]
+# 
+# Commands sent from the remote to the bath:
+# 0xA5 0x01 0x0[0][1] 0xXX: 
+#   Heater on(1)/off(0)
+# 
+# 0xA5 0x02 0x0[0][1] 0xXX: 
+#   Filter on(1)/off(0)
+# 
+# 0xA5 0x03 0x0[0 -3] 0xXX: 
+#   Bubble level 0(off)-3
+# 
+# 0xA5 0x0D 0x0[0][1] 0xXX: 
+#   Jet on(1)/off(0)
+# 
+# 0xA5 0x0E 0x0[0][1] 0xXX: 
+#   Ozone on(1)/off(0)
+# 
+# 0xA5 0x15 0x0[0][1] 0xXX: 
+#   UVC on(1)/off(0)
+# 
+# 0xA5 0x04 0x0[xx] 0xXX: 
+#   Set target temperature to xx (20-40 on my bath) (some baths expect value x 2).
+#   Note: I dont know if this actually does anything, when I set it to a temperature already reached, 
+#         the heater still runs, checked with a power meter.
+# 
+# 0xA5 0x0B 0x00 0xXX: 
+#   Sent by the controller when resetting the bath after an error, like F-1 (flow error). This is
+#   done by long pressing the "Filter" button.
+# 
+# Commands/statuses sent from the bath to the remote:
+# 0xA5 0x06 0x[xx] 0xXX:
+#   Current temperature value * 2. Divide by 2 to get the value in Celsius. Note that the division
+#   should be done even if the remote dont need to send the target temperature * 2.
+#   Value is down to .5°C accuracy.
+# 
+# 0xA5 0x08 0x0[x] 0xXX:
+#   Bath status. The values I have seen is 0x00 and 0x03. 0 is when the bath is not running, and 3 when its running.
+#   When sending the 0x0B reset command, this will temporarily respond 3 and then 0 again. The module uses this for
+#   the reset switch that will both turn off all other switches and send the command.
+# 
+# Unknown commands sent by the remote, further investigation needed:
+# 0xA5 0x09 
+# 0xA5 0x10 
+# 0xA5 0x11 
+# 0xA5 0x0A 
+# One of these could be related to the timer function
+# 
+# Unknown commands sent by the bath, further investigation needed:
+# 0xA5 0x12 0x00 0xXX
+#   Continuously sends 0 as value, have not seen any other value sent
+#
+# 0xA5 0x07 0x0C 0xXX
+#   Continuously sends 0x0C (12) as value, have not seen any other value sent
+#
+#
+#
+
+esphome:
+  name: m-spa-controller
+  friendly_name: M-Spa controller
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: INFO
+
+# Enable Home Assistant API
+# the encryption key is just a randomly generated key from here: https://esphome.io/components/api.html
+api:
+  encryption:
+    key: "DbYfh5MrzMMtWubnHlbiQ4Sm1240kAr0d5i6a+7MD5Q="
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "M-Spa-Controller"
+    password: "somesecretpassword"
+
+captive_portal:
+
+uart:
+  id: uart_bus
+  tx_pin: 17
+  rx_pin: 16
+  baud_rate: 9600
+
+globals:
+  - id: pending_temp
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: target_temp_val
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: current_temp_val
+    type: double
+    restore_value: no
+    initial_value: '0'
+  - id: bath_type_val #bath type value
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: prev_status_code
+    type: bool
+    restore_value: no
+    initial_value: '0'
+  - id: bubble_level_val
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: target_reached
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+sensor:
+  - platform: template
+    name: "Current Temperature"
+    id: current_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: homeassistant #remove this part entirely if you dont have a power meter
+    name: "Current power"
+    id: current_power
+    entity_id: sensor.energimatare_spabad_power #rename this to a power sentor conencted to the bath
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    internal: false
+    disabled_by_default: true
+
+text_sensor:
+  - platform: template
+    name: "Status code"
+    id: status_code_text
+    update_interval: never
+  - platform: template
+    name: "Last error message"
+    id: error_message
+    update_interval: never
+
+number:
+  - platform: template
+    name: "Target temperature"
+    id: target_temp
+    min_value: 20
+    max_value: 40
+    initial_value: 40 # spa default
+    restore_value: true
+    step: 1
+    optimistic: true
+    unit_of_measurement: "°C"
+    on_value:
+      then: 
+        - lambda: |-
+            id(target_temp_val) = (int)x;
+            id(pending_temp) = true;
+  - platform: template
+    name: "Bubble level"
+    id: bubble_level
+    min_value: 0
+    max_value: 3
+    initial_value: 0
+    step: 1
+    optimistic: true
+    on_value:
+      then: 
+        - lambda: |-
+            id(bubble_level_val) = (int)x;
+
+select:
+  - platform: template
+    name: "Bath type"
+    id: bath_type
+    options: 
+      - "Unknown"
+      - "Premium Camaro"
+#      - "Rimba"
+      - "Other (double temp)"
+    optimistic: True
+    initial_option: "Premium Camaro"
+    set_action: 
+      then:
+        - lambda: |-
+            if(x == "Unknown") {
+              id(bath_type_val) = 0;
+            } else if(x == "Premium Camaro") {
+              id(bath_type_val) = 1;
+            } else if(x == "Rimba") {
+              id(bath_type_val) = 2;
+            } else{
+              id(bath_type_val) = 99;
+            }
+
+switch:
+  - platform: template
+    name: "Heater"
+    id: heater_switch
+    optimistic: true
+    on_turn_on:
+      then:
+        - switch.turn_on: filter_switch
+
+  - platform: template
+    name: "Jet"
+    id: jet_switch
+    optimistic: true
+    disabled_by_default: true
+
+  - platform: template
+    name: "UVC"
+    id: uvc_switch
+    optimistic: true
+    disabled_by_default: true
+
+  - platform: template
+    name: "Ozone"
+    id: ozone_switch
+    optimistic: true
+    on_turn_on: 
+      then:
+        - switch.turn_on: filter_switch
+
+  - platform: template
+    name: "Filter"
+    id: filter_switch
+    optimistic: true
+    on_turn_off: 
+      then:
+        - switch.turn_off: heater_switch
+    on_turn_on: 
+      then:
+        lambda: |-
+          id(prev_status_code) = 0;
+
+  - platform: template
+    name: "Reset"
+    id: reset_switch
+    optimistic: true
+    on_turn_on: 
+      then:
+        - switch.turn_off: filter_switch
+        - switch.turn_off: heater_switch
+        - switch.turn_off: jet_switch
+        - switch.turn_off: ozone_switch
+        - switch.turn_off: uvc_switch
+        - script.execute: temp_report_heartbeat
+        - number.set: 
+            id: bubble_level
+            value: 0
+        - lambda: 
+            id(prev_status_code) = 0;
+
+
+  - platform: restart
+    name: "M-spa Controller restart"
+
+script:
+  - id: temp_report_heartbeat
+    mode: restart
+    then:
+      - delay: 120s
+      - lambda: 
+          id(error_message).publish_state("Temp sensor error after 120s");
+          id(reset_switch).publish_state(true);
+
+interval:
+  - interval: 200ms
+    then:
+      - lambda: |-
+          uint8_t b;
+          while (id(uart_bus).read_byte(&b)) {
+            static uint8_t buffer[4];
+            static int index = 0;
+
+            if (b == 0xA5) {
+              // Start of a new frame, reset buffer
+              index = 0;
+              buffer[index++] = b;
+              //ESP_LOGD("uart", "[RX] Start-Byte 0xA5 received - new sequence begins");
+            } else if (index > 0 && index < 4) {
+              buffer[index++] = b;
+              if (index == 4) {
+                // As soon as 4 bytes are in the buffer, log the complete sequence
+                ESP_LOGD("uart", "[RX] Received complete sequence: 0x%02X 0x%02X 0x%02X 0x%02X",
+                        buffer[0], buffer[1], buffer[2], buffer[3]);
+                
+                uint8_t checksum = (buffer[0] + buffer[1] + buffer[2]) & 0xFF;
+                if (checksum == buffer[3]) {
+                  uint8_t code = buffer[1];
+                  uint8_t value = buffer[2];
+                  if (code == 0x06) {
+                    id(current_temp_val) = value / 2.0f;
+                    id(current_temp).publish_state(id(current_temp_val));
+                    ESP_LOGI("logic", "Bath reported temperature: %.1f", id(current_temp_val));
+                    id(temp_report_heartbeat).execute();
+                  }
+
+                  if(code == 0x08) {
+                    char str[4]; // Enough to hold 3 digits and a null terminator
+                    snprintf(str, sizeof(str), "%u", value); // Convert to string safely
+
+                    // bath is running
+                    if(value == 0x03) {
+                      // if this is 0, it was just started or the reset switch was flipped
+                      if(id(prev_status_code) == 0) {
+                        if(id(reset_switch).state) {
+                          ESP_LOGI("logic", "Bath reset with signal [0x%02X].", value);
+                        } else {
+                          ESP_LOGI("logic", "Bath started with signal [0x%02X].", value);
+                        }
+                      }
+                      id(prev_status_code) = value;
+                      id(status_code_text).publish_state("Running");
+                    } else if(value == 0x00) {
+                      if(id(prev_status_code) == 3) { // bath unexpectedly turned off, set error and set statuses to 0
+                        ESP_LOGE("logic", "Bath sent off signal [0x%02X] during normal operation, resetting controller.", value);
+                        id(prev_status_code) = value; // update status code to set it off
+                        id(reset_switch).publish_state(true); // trigger reset to shut off all functions
+                        id(status_code_text).publish_state("Error");
+                        id(error_message).publish_state("Bath sent off signal during normal operation");
+                      } else if(id(reset_switch).state) {
+                        ESP_LOGI("logic", "Bath sent off signal [0x%02X] following reset switch trigger, bath can be started again.", value);
+                        id(reset_switch).publish_state(false); // turn off reset switch as its done its job
+                        id(prev_status_code) = value; // update status code to set it off
+                        id(status_code_text).publish_state("Error");
+                        id(error_message).publish_state("Reset switch triggered");
+                      } else {
+                        id(status_code_text).publish_state("Idle");
+                      }
+                    } else {
+                      ESP_LOGE("logic", "Bath sent unknown signal [0x%02X] during normal operation, resetting controller.", value);
+                      id(prev_status_code) = value;
+                      id(reset_switch).publish_state(true); // reset as we dont know whats going on
+                      id(status_code_text).publish_state("Error");
+                      id(error_message).publish_state("Bath sent unknow status signal during normal operation");
+                    }
+                  }
+                } else {
+                  ESP_LOGW("uart", "[RX] Checksum error: Expected 0x%02X, received 0x%02X", checksum, buffer[3]);
+                }
+                index = 0;
+
+                // stopping here or we will keep spamming the bus until we get an error
+                break;
+              }
+            } else {
+              // If a byte is received outside of an expected frame
+              ESP_LOGW("uart", "[RX] Unexpected byte received: 0x%02X", b);
+            }
+          }
+
+  - interval: 1000ms
+    then:
+      - lambda: |-
+          auto send_frame = [](uint8_t code, uint8_t value) {
+            uint8_t chk = (0xA5 + code + value) & 0xFF;
+            std::vector<uint8_t> frame = {0xA5, code, value, chk};
+            id(uart_bus).write_array(frame.data(), frame.size());
+            ESP_LOGD("uart send", "[TX] 0xA5 0x%02X 0x%02X 0x%02X", code, value, chk);
+            //delay(50);
+          };
+
+          // Control logic
+
+          // 0x0B value 0 is sent when the bath is reset by long-pressing the filter button after an error code like E1/F1 (flow error)
+          // if reset is successful, the bath should momentarily send back 0x08 0x03 which should turn off the reset switch again
+          // also, the reset switch will turn off all other switches
+          if(id(reset_switch).state) {
+            send_frame(0x0B, 0x00);
+          }
+
+          // filter on/off
+          uint8_t filterVal = id(filter_switch).state ? 0x01 : 0x00;
+          send_frame(0x02, filterVal);
+
+          // heater logic
+          uint8_t heaterVal = 0x00;
+          if(id(heater_switch).state && id(filter_switch).state) { // only set heater if also filter is set
+            if(id(target_reached)) { // we already reached the target temperature, wait until we drop .5 below it again
+              if(id(current_temp_val) < id(target_temp_val)) { // droppped below temp, target not reached anymore
+                id(target_reached) = false;
+              }
+            } else { // keep heating
+              if(id(current_temp_val) <= id(target_temp_val)) { // current temp is .5 intervals, so it will heat until it reaches target + .5
+                heaterVal = 0x01;
+              } else { // target reached, we set this to avoid turning heater on/off continuously once target temp is hit
+                id(target_reached) = true;
+              }
+            }
+          }
+          send_frame(0x01, heaterVal);
+          
+          // bubble level is 0-3 (0 is off)
+          uint8_t bubbleVal = id(bubble_level_val);
+          send_frame(0x03, bubbleVal);
+
+          // ozone on/off
+          uint8_t ozoneVal = id(ozone_switch).state ? 0x01 : 0x00;
+          send_frame(0x0E, ozoneVal);
+          
+          // jet on/off
+          uint8_t jetVal =  id(jet_switch).state ? 0x01 : 0x00;
+          send_frame(0x0D, jetVal);
+
+          // uvc on/off
+          uint8_t uvcVal = id(uvc_switch).state ? 0x01 : 0x00;
+          send_frame(0x15, uvcVal);
+
+          // this is not sent by the controller for the m-spa premium camaro spabath
+          send_frame(0x16, 0x00); // Heartbeat
+
+          // target temp setting was changed, send new value
+          if (id(pending_temp)) {
+            // set target temperature
+            // some baths seem to want this value doubled, the premium camaro expects the actual value, so ex 0x28 for 40C
+            int multiplier = 1;
+            if(id(bath_type_val) == 99) {
+              multiplier = 2;
+            }
+            send_frame(0x04, id(target_temp_val) * multiplier);
+            id(pending_temp) = false;
+          }
+
+          ESP_LOGI("logic", "Filter: %u | Heater: %u | Bubble: %u | Ozone: %u | Jet: %u | UVC: %u | Target: %u | Current: %.1f | Target reached: %d", 
+            filterVal, heaterVal, bubbleVal, ozoneVal, jetVal, uvcVal, id(target_temp_val), id(current_temp_val), id(target_reached));
+
+        

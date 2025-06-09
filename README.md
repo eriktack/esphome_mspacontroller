@@ -23,10 +23,10 @@ I recommend just getting a real one though, theyre quite cheap:
 https://hackaday.com/2016/12/05/taking-it-to-another-level-making-3-3v-and-5v-logic-communicate-with-level-shifters/
 
 ## Hardware
-M-Spa Super Camaro P-CA069 (5V logic levels)
-AZDelivery ESP32 Dev Kit C V4 NodeMCU WLAN WiFi Development Board (Amazon)
-Gebildet 3.3V-5V 4 Channel Logic Level Converter Bi-Directional Shifter Module CYT1076 (Amazon)
-Male JST XH 2.54mm 4 Pin connector (the one with the housing)
+* M-Spa Super Camaro P-CA069 (5V logic levels)
+* AZDelivery ESP32 Dev Kit C V4 NodeMCU WLAN WiFi Development Board (Amazon)
+* Gebildet 3.3V-5V 4 Channel Logic Level Converter Bi-Directional Shifter Module CYT1076 (Amazon)
+* Male JST XH 2.54mm 4 Pin connector (the one with the housing)
 
 I tried to mimic the remote as much as I could, but some functionality might not work exactly as the original remote. 
 I did not bother to figure out the timer for example as that can be handled from Home Assistant instead.
